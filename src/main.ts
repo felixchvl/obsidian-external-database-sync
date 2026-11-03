@@ -1,63 +1,90 @@
 import type { TAbstractFile } from "obsidian";
 import { Notice, Plugin, normalizePath } from "obsidian";
-import type { ConnectionSettings, CopyReport } from "./mirror.ts";
+import type { BringBackReport, ConnectionSettings, CopyReport } from "./mirror.ts";
+import { ChangeListener } from "./listener.ts";
 import { MirrorError, PostgreSQLMirror, messageOf, missingSetting } from "./mirror.ts";
 import { declaredTypes, defaultPlacePropertyNames, distinctNames } from "./properties.ts";
-import type { MirrorSettings } from "./settings.ts";
-import { MirrorSettingTab, defaultSettings } from "./settings.ts";
+import type { SyncSettings } from "./settings.ts";
+import { SyncSettingTab, defaultSettings } from "./settings.ts";
 import { VaultReader } from "./vault-reader.ts";
+import { VaultWriter } from "./vault-writer.ts";
 
-/** A change is copied once the vault has been still this long… */
+/** A change is synced once the vault has been still this long… */
 const quietDelayMs = 2_000;
 /** …or this long after the first change, while you keep typing. */
 const longestDelayMs = 30_000;
-/** A plugin's settings file larger than this is not read: it is not the mirror's to trust. */
+/** More edits from the database than this wait for you to apply them. */
+const largestAutomaticBatch = 50;
+/** How long a sync waits for Obsidian to read the notes it just edited before copying them. */
+const metadataWaitMs = 3_000;
+/** A plugin's settings file larger than this is not read: it is not the plugin's to trust. */
 const largestSettingsFileBytes = 1_048_576;
 
-type CopyStatus =
+interface SyncReport {
+	copy: CopyReport;
+	/** Undefined when bringing edits back is turned off. */
+	brought: BringBackReport | undefined;
+}
+
+type SyncStatus =
 	| { kind: "idle" }
-	| { kind: "copying" }
-	| { kind: "copied"; report: CopyReport; at: Date }
+	| { kind: "syncing" }
+	| { kind: "synced"; report: SyncReport; at: Date }
 	| { kind: "failed"; message: string; at: Date };
 
-export default class VaultToPostgreSQLPlugin extends Plugin {
-	settings: MirrorSettings = { ...defaultSettings };
+interface SyncOptions {
+	/** Deletes the vault's rows first, so every note is written again. */
+	rebuilds: boolean;
+	/** Reads what the database holds again rather than trusting the last copy. */
+	rechecksDatabase: boolean;
+	/** Applies the database's edits however many there are. */
+	appliesHeldEdits: boolean;
+}
+
+export default class PostgreSQLSyncPlugin extends Plugin {
+	settings: SyncSettings = { ...defaultSettings };
 	private reader!: VaultReader;
+	private writer!: VaultWriter;
 	private mirror: PostgreSQLMirror | undefined;
 	private mirrorKey = "";
+	private listener: ChangeListener | undefined;
+	private listenerKey = "";
 	private statusBar!: HTMLElement;
-	private status: CopyStatus = { kind: "idle" };
+	private status: SyncStatus = { kind: "idle" };
+	/** The edits the database holds for you to apply, as the last sync found them. */
+	heldEditCount = 0;
 	private isLayoutReady = false;
 	private timer: number | undefined;
 	private firstChangeAt: number | undefined;
-	/** The copy running now, which the next one waits for: one copy at a time. */
+	/** The sync running now, which the next one waits for: one sync at a time. */
 	private running: Promise<unknown> = Promise.resolve();
-	/** A scheduled copy waiting for the running one; later changes join it. */
-	private waiting: Promise<CopyReport> | undefined;
+	/** A scheduled sync waiting for the running one; later changes join it. */
+	private waiting: Promise<SyncReport> | undefined;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.reader = new VaultReader(this.app);
+		this.writer = new VaultWriter(this.app);
 		this.statusBar = this.addStatusBarItem();
-		this.addSettingTab(new MirrorSettingTab(this.app, this));
+		this.addSettingTab(new SyncSettingTab(this.app, this));
 
+		const notify = (work: Promise<unknown>) => void work.catch((error: unknown) => new Notice(messageOf(error)));
+		this.addCommand({ id: "sync-now", name: "Sync now", callback: () => notify(this.syncNow()) });
+		this.addCommand({ id: "copy-every-note-again", name: "Copy every note again", callback: () => notify(this.syncNow({ rebuilds: true })) });
 		this.addCommand({
-			id: "copy-now",
-			name: "Copy the vault now",
-			callback: () => void this.copyNow().catch((error: unknown) => new Notice(messageOf(error))),
+			id: "apply-held-edits",
+			name: "Apply the edits held in the database",
+			callback: () => notify(this.syncNow({ appliesHeldEdits: true })),
 		});
 		this.addCommand({
-			id: "copy-every-note-again",
-			name: "Copy every note again",
-			callback: () => void this.copyNow({ rebuilds: true }).catch((error: unknown) => new Notice(messageOf(error))),
+			id: "discard-held-edits",
+			name: "Discard the edits held in the database",
+			callback: () => notify(this.discardHeldEdits().then((count) => new Notice(`${count} edits discarded.`))),
 		});
 		this.addCommand({
 			id: "test-connection",
 			name: "Test the connection",
-			callback: () => void this.describeServer().then(
-				(description) => new Notice(description),
-				(error: unknown) => new Notice(messageOf(error)),
-			),
+			callback: () => notify(this.describeServer().then((description) => new Notice(description))),
 		});
 		this.registerCommandLine();
 
@@ -67,35 +94,56 @@ export default class VaultToPostgreSQLPlugin extends Plugin {
 			this.registerEvent(this.app.vault.on("create", (file) => this.fileChanged(file)));
 			this.registerEvent(this.app.vault.on("delete", (file) => this.fileChanged(file)));
 			this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.fileChanged(file, oldPath)));
-			this.registerEvent(this.app.metadataCache.on("changed", () => this.scheduleCopy()));
-			this.registerEvent(this.app.metadataCache.on("deleted", () => this.scheduleCopy()));
+			this.registerEvent(this.app.metadataCache.on("changed", () => this.scheduleSync()));
+			this.registerEvent(this.app.metadataCache.on("deleted", () => this.scheduleSync()));
 			// Obsidian has read every note: the copy can no longer miss one.
-			this.registerEvent(this.app.metadataCache.on("resolved", () => this.scheduleCopy()));
-			this.scheduleCopy(0);
+			this.registerEvent(this.app.metadataCache.on("resolved", () => this.scheduleSync()));
+			this.scheduleSync(0);
+			this.updateListener();
 		});
 		this.showStatus();
 	}
 
 	onunload(): void {
 		window.clearTimeout(this.timer);
+		this.listener?.stop();
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = { ...defaultSettings, ...((await this.loadData()) as Partial<MirrorSettings> | null) };
+		this.settings = { ...defaultSettings, ...((await this.loadData()) as Partial<SyncSettings> | null) };
 	}
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 		this.showStatus();
+		this.updateListener();
 	}
 
 	private fileChanged(file: TAbstractFile, oldPath?: string): void {
 		this.reader.fileChanged(file, oldPath);
-		this.scheduleCopy();
+		this.scheduleSync();
 	}
 
-	/** Copies soon, once the vault has been still for a moment, when copying automatically. */
-	scheduleCopy(delayMs = quietDelayMs): void {
+	/** Listens for the database's edits while syncing automatically and bringing them back, so they arrive within seconds. */
+	private updateListener(): void {
+		const connection = this.connectionSettings();
+		const listens = this.isLayoutReady && this.settings.copiesAutomatically && this.settings.bringsBackEdits
+			&& missingSetting(connection) === undefined;
+		const key = listens ? JSON.stringify([connection, this.vaultName()]) : "";
+		if (key === this.listenerKey) return;
+		this.listener?.stop();
+		this.listener = undefined;
+		this.listenerKey = key;
+		if (!listens) return;
+		this.listener = new ChangeListener(connection, this.vaultName(), () => this.scheduleSync(500), {
+			setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+			clearTimeout: (timer) => window.clearTimeout(timer),
+		});
+		this.listener.start();
+	}
+
+	/** Syncs soon, once the vault has been still for a moment, when syncing automatically. */
+	scheduleSync(delayMs = quietDelayMs): void {
 		if (!this.settings.copiesAutomatically || !this.isLayoutReady) return;
 		const now = Date.now();
 		this.firstChangeAt ??= now;
@@ -103,66 +151,121 @@ export default class VaultToPostgreSQLPlugin extends Plugin {
 		window.clearTimeout(this.timer);
 		this.timer = window.setTimeout(() => {
 			this.firstChangeAt = undefined;
-			void this.scheduledCopy();
+			void this.scheduledSync();
 		}, delay);
 	}
 
-	private async scheduledCopy(): Promise<void> {
+	private async scheduledSync(): Promise<void> {
 		const wasFailing = this.status.kind === "failed";
+		const heldBefore = this.heldEditCount;
 		try {
-			await this.enqueueCopy({ rebuilds: false, rechecksDatabase: false });
+			const report = await this.enqueueSync({ rebuilds: false, rechecksDatabase: false, appliesHeldEdits: false });
+			const brought = report.brought;
+			if (brought && brought.heldCount > 0 && brought.heldCount !== heldBefore) {
+				new Notice(`PostgreSQL Sync: the database holds ${brought.heldCount} edits, more than ${largestAutomaticBatch} at once. `
+					+ "Run “Apply the edits held in the database” to bring them into your notes, or “Discard” them.", 15_000);
+			}
+			if (brought && brought.failedCount > 0) {
+				new Notice(`PostgreSQL Sync: ${brought.failedCount} edits from the database could not be applied: ${brought.failures.join("; ")}`, 15_000);
+			}
 		} catch (error) {
-			// Obsidian is still reading the vault: the `resolved` event schedules the copy again.
+			// Obsidian is still reading the vault: the `resolved` event schedules the sync again.
 			if (error instanceof VaultNotReadError) return;
 			// Said once, not at every change while the server stays unreachable.
-			if (!wasFailing) new Notice(`Vault to PostgreSQL: ${messageOf(error)}`);
+			if (!wasFailing) new Notice(`PostgreSQL Sync: ${messageOf(error)}`);
 		}
 	}
 
-	/** Copies now, whether or not copying is automatic; `rebuilds` deletes the vault's rows first. */
-	async copyNow(options: { rebuilds?: boolean } = {}): Promise<CopyReport> {
-		return this.enqueueCopy({ rebuilds: options.rebuilds ?? false, rechecksDatabase: true });
+	/** Syncs now, whether or not syncing is automatic. */
+	async syncNow(options: { rebuilds?: boolean; appliesHeldEdits?: boolean } = {}): Promise<SyncReport> {
+		return this.enqueueSync({
+			rebuilds: options.rebuilds ?? false,
+			rechecksDatabase: true,
+			appliesHeldEdits: options.appliesHeldEdits ?? false,
+		});
 	}
 
-	private enqueueCopy(options: { rebuilds: boolean; rechecksDatabase: boolean }): Promise<CopyReport> {
-		const joinsWaitingCopy = !options.rebuilds && !options.rechecksDatabase;
-		if (joinsWaitingCopy && this.waiting) return this.waiting;
-		const copy: Promise<CopyReport> = this.running
+	/** Gives up the edits the database holds; the next copy writes their rows again from the vault. */
+	async discardHeldEdits(): Promise<number> {
+		const connection = this.connectionSettings();
+		const missing = missingSetting(connection);
+		if (missing) throw new MirrorError(`Fill in ${missing} in the settings.`);
+		const count = await this.mirrorFor(connection).discardChanges(this.vaultName(), "Discarded from Obsidian.");
+		this.heldEditCount = 0;
+		await this.syncNow();
+		return count;
+	}
+
+	private enqueueSync(options: SyncOptions): Promise<SyncReport> {
+		const joinsWaitingSync = !options.rebuilds && !options.rechecksDatabase && !options.appliesHeldEdits;
+		if (joinsWaitingSync && this.waiting) return this.waiting;
+		const sync: Promise<SyncReport> = this.running
 			.catch(() => undefined)
 			.then(() => {
-				if (this.waiting === copy) this.waiting = undefined;
-				return this.copyOnce(options);
+				if (this.waiting === sync) this.waiting = undefined;
+				return this.syncOnce(options);
 			});
-		if (joinsWaitingCopy) this.waiting = copy;
-		this.running = copy;
-		return copy;
+		if (joinsWaitingSync) this.waiting = sync;
+		this.running = sync;
+		return sync;
 	}
 
-	private async copyOnce(options: { rebuilds: boolean; rechecksDatabase: boolean }): Promise<CopyReport> {
+	/** Brings the database's edits into the vault, then copies the vault into the database. */
+	private async syncOnce(options: SyncOptions): Promise<SyncReport> {
 		const connection = this.connectionSettings();
 		const missing = missingSetting(connection);
 		if (missing) throw this.failed(new MirrorError(`Fill in ${missing} in the settings.`));
-		const [typesJson, placePropertyNames] = await Promise.all([this.readConfigFile("types.json"), this.placePropertyNames()]);
-		const state = this.reader.state({
-			vault: this.vaultName(),
-			declaredTypes: declaredTypes(typesJson),
-			placePropertyNames,
-			excludedFolders: this.settings.excludedFolders.split("\n"),
-		});
-		if (!state) throw new VaultNotReadError("Obsidian is still reading the vault; try again in a moment.");
 		const mirror = this.mirrorFor(connection);
-		this.status = { kind: "copying" };
+		const vault = this.vaultName();
+		const excludedFolders = this.settings.excludedFolders.split("\n");
+		this.status = { kind: "syncing" };
 		this.showStatus();
 		try {
-			if (options.rebuilds) await mirror.forget(state.vault);
-			const report = await mirror.copy(state, { rechecksDatabase: options.rechecksDatabase });
-			this.status = { kind: "copied", report, at: new Date() };
+			const placePropertyNames = await this.placePropertyNames();
+			let brought: BringBackReport | undefined;
+			if (this.settings.bringsBackEdits) {
+				brought = await mirror.bringBack(
+					vault,
+					(change) => this.writer.apply(change, { placePropertyNames, excludedFolders }),
+					{ largestBatch: largestAutomaticBatch, confirmed: options.appliesHeldEdits },
+				);
+				this.heldEditCount = brought.heldCount;
+				// The copy reads what Obsidian makes of the notes just edited.
+				if (brought.appliedCount > 0) await this.metadataSettled();
+			} else {
+				await mirror.discardChanges(vault, "Bringing database edits into the vault is turned off.");
+				this.heldEditCount = 0;
+			}
+			const typesJson = await this.readConfigFile("types.json");
+			const state = this.reader.state({ vault, declaredTypes: declaredTypes(typesJson), placePropertyNames, excludedFolders });
+			if (!state) throw new VaultNotReadError("Obsidian is still reading the vault; try again in a moment.");
+			if (options.rebuilds) await mirror.forget(vault);
+			const copy = await mirror.copy(state, { rechecksDatabase: options.rechecksDatabase || (brought?.appliedCount ?? 0) > 0 });
+			const report = { copy, brought };
+			this.status = { kind: "synced", report, at: new Date() };
 			return report;
 		} catch (error) {
+			if (error instanceof VaultNotReadError) {
+				this.status = { kind: "idle" };
+				throw error;
+			}
 			throw this.failed(error);
 		} finally {
 			this.showStatus();
 		}
+	}
+
+	/** Waits until Obsidian has read the vault's latest changes, or a few seconds at most. */
+	private metadataSettled(): Promise<void> {
+		return new Promise((resolve) => {
+			const settled = () => {
+				this.app.metadataCache.offref(reference);
+				window.clearTimeout(timeout);
+				resolve();
+			};
+			const reference = this.app.metadataCache.on("resolved", settled);
+			const timeout = window.setTimeout(settled, metadataWaitMs);
+		});
 	}
 
 	private failed(error: unknown): unknown {
@@ -195,7 +298,7 @@ export default class VaultToPostgreSQLPlugin extends Plugin {
 		};
 	}
 
-	/** One mirror per server and schema, so it remembers what the database holds between copies. */
+	/** One mirror per server and schema, so it remembers what the database holds between syncs. */
 	private mirrorFor(connection: ConnectionSettings): PostgreSQLMirror {
 		const key = JSON.stringify(connection);
 		if (!this.mirror || key !== this.mirrorKey) {
@@ -254,21 +357,27 @@ export default class VaultToPostgreSQLPlugin extends Plugin {
 		}
 	}
 
-	/** The last copy, in words, for the settings, the status bar's tooltip and the command line. */
+	/** The last sync, in words, for the settings, the status bar's tooltip and the command line. */
 	statusText(): string {
 		const status = this.status;
 		switch (status.kind) {
 			case "idle":
-				return this.settings.copiesAutomatically ? "Waiting for Obsidian to read the vault." : "Not copied yet: turn on Copy automatically, or copy now.";
-			case "copying":
-				return "Copying…";
-			case "copied": {
-				const report = status.report;
-				const changes = report.writtenNoteCount + report.deletedNoteCount === 0
-					? "nothing had changed"
-					: `${report.writtenNoteCount} written, ${report.deletedNoteCount} deleted`;
-				const geometry = report.hasGeometry ? ", with PostGIS points" : "";
-				return `${report.copiedNoteCount} notes in PostgreSQL${geometry} at ${status.at.toLocaleTimeString()}: ${changes} (${report.elapsedMs} ms).`;
+				return this.settings.copiesAutomatically ? "Waiting for Obsidian to read the vault." : "Not synced yet: turn on Sync automatically, or sync now.";
+			case "syncing":
+				return "Syncing…";
+			case "synced": {
+				const { copy, brought } = status.report;
+				const copied = copy.writtenNoteCount + copy.deletedNoteCount === 0
+					? "nothing to copy"
+					: `${copy.writtenNoteCount} notes written, ${copy.deletedNoteCount} deleted`;
+				const geometry = copy.hasGeometry ? ", with PostGIS points" : "";
+				const edits = [
+					brought && brought.appliedCount > 0 ? `${brought.appliedCount} edits from the database applied` : "",
+					brought && brought.failedCount > 0 ? `${brought.failedCount} could not be (${brought.failures.join("; ")})` : "",
+					brought && brought.heldCount > 0 ? `${brought.heldCount} held for you to apply or discard` : "",
+				].filter((part) => part !== "");
+				return `${copy.copiedNoteCount} notes in PostgreSQL${geometry} at ${status.at.toLocaleTimeString()}: `
+					+ [copied, ...edits].join(", ") + ` (${copy.elapsedMs} ms).`;
 			}
 			case "failed":
 				return `Failed at ${status.at.toLocaleTimeString()}: ${status.message}`;
@@ -277,46 +386,50 @@ export default class VaultToPostgreSQLPlugin extends Plugin {
 
 	private showStatus(): void {
 		const status = this.status;
-		const label = status.kind === "copying" ? "PostgreSQL: copying…"
-			: status.kind === "failed" ? "PostgreSQL: copy failed"
-			: status.kind === "copied" ? `PostgreSQL: ${status.report.copiedNoteCount} notes`
+		const label = status.kind === "syncing" ? "PostgreSQL: syncing…"
+			: status.kind === "failed" ? "PostgreSQL: sync failed"
+			: status.kind === "synced" ? `PostgreSQL: ${status.report.copy.copiedNoteCount} notes`
+				+ (this.heldEditCount > 0 ? `, ${this.heldEditCount} edits held` : "")
 			: "";
 		this.statusBar.setText(this.settings.copiesAutomatically || status.kind !== "idle" ? label : "");
 		this.statusBar.setAttribute("aria-label", this.statusText());
 	}
 
-	/** `obsidian vault-to-postgresql`, `…:copy` and `…:test`, for the terminal, scripts and agents. */
+	/** `obsidian postgresql-sync`, `…:sync`, `…:discard` and `…:test`, for the terminal, scripts and agents. */
 	private registerCommandLine(): void {
-		this.registerCliHandler("vault-to-postgresql", "Show where the vault is copied and how the last copy went", null, () => {
-			const settings = this.settings;
-			const lines = [
-				`Server: ${settings.user || "?"}@${settings.host}:${settings.port}/${settings.database || "?"}, schema ${settings.schema}`,
-				`Vault: ${this.vaultName()}`,
-				`Copies automatically: ${settings.copiesAutomatically ? "yes" : "no"}`,
-				`Last copy: ${this.statusText()}`,
-			];
-			return lines.join("\n");
-		});
-		this.registerCliHandler(
-			"vault-to-postgresql:copy",
-			"Copy the vault into PostgreSQL now",
-			{ rebuild: { description: "Delete the vault's rows first, and copy every note again" } },
-			async (params) => {
-				try {
-					await this.copyNow({ rebuilds: params.rebuild === "true" });
-					return this.statusText();
-				} catch (error) {
-					return `Error: ${messageOf(error)}`;
-				}
-			},
-		);
-		this.registerCliHandler("vault-to-postgresql:test", "Connect to PostgreSQL and show its version", null, async () => {
+		const answer = async (work: () => Promise<string>) => {
 			try {
-				return await this.describeServer();
+				return await work();
 			} catch (error) {
 				return `Error: ${messageOf(error)}`;
 			}
+		};
+		this.registerCliHandler("postgresql-sync", "Show where the vault syncs and how the last sync went", null, () => {
+			const settings = this.settings;
+			return [
+				`Server: ${settings.user || "?"}@${settings.host}:${settings.port}/${settings.database || "?"}, schema ${settings.schema}`,
+				`Vault: ${this.vaultName()}`,
+				`Syncs automatically: ${settings.copiesAutomatically ? "yes" : "no"}`,
+				`Brings database edits into the vault: ${settings.bringsBackEdits ? "yes" : "no"}`,
+				`Last sync: ${this.statusText()}`,
+			].join("\n");
 		});
+		this.registerCliHandler(
+			"postgresql-sync:sync",
+			"Sync now: bring the database's edits into the vault, then copy the vault into the database",
+			{
+				rebuild: { description: "Delete the vault's rows first, and copy every note again" },
+				apply: { description: `Apply the database's edits even when there are more than ${largestAutomaticBatch}` },
+			},
+			(params) => answer(async () => {
+				await this.syncNow({ rebuilds: params.rebuild === "true", appliesHeldEdits: params.apply === "true" });
+				return this.statusText();
+			}),
+		);
+		this.registerCliHandler("postgresql-sync:discard", "Discard the edits held in the database, then sync", null, () =>
+			answer(async () => `${await this.discardHeldEdits()} edits discarded. ${this.statusText()}`));
+		this.registerCliHandler("postgresql-sync:test", "Connect to PostgreSQL and show its version", null, () =>
+			answer(() => this.describeServer()));
 	}
 }
 

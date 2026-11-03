@@ -3,14 +3,18 @@ import { compareText } from "./properties.ts";
 
 /**
  * The SQL the mirror runs, for one schema. Names the mirror does not choose (the schema, the
- * properties) are always quoted; values are bound as parameters, except in the view, whose
- * definition cannot hold parameters, where property names are written as escaped literals.
+ * properties) are always quoted; values are bound as parameters, except in the view and the
+ * functions, whose definitions cannot hold parameters, where names are escaped literals.
  *
- * The tables are those of Graphite's PostgreSQL Mirror, so both can fill the same schema.
+ * The tables are those of Graphite's PostgreSQL Mirror, with version 2's `changes` beside them.
  */
 export class MirrorStatements {
-	/** The schema version these statements create. A later version adds a migration. */
-	static readonly schemaVersion = 1;
+	/** The schema version these statements create: 1 is the copy, 2 brings edits made in the database back. */
+	static readonly schemaVersion = 2;
+	/** Marks a transaction as the plugin's own, so the triggers tell its writes from edits made in the database. */
+	static readonly vaultWriterMark = "SET LOCAL obsidian.writer = 'vault'";
+	/** The channel the triggers notify when the database is edited; the payload names the schema and the vault. */
+	static readonly changeChannel = "obsidian_changes";
 	/** PostgreSQL truncates longer identifiers, which could make two columns one. */
 	static readonly maximumIdentifierBytes = 63;
 	/** A view holds at most 1,664 columns; the most used properties get one, the rest stay in `properties`. */
@@ -81,7 +85,8 @@ export class MirrorStatements {
   note_count integer NOT NULL,
   PRIMARY KEY (vault, property_name)
 )`,
-			`INSERT INTO ${schema}.mirror_schema (version) SELECT ${MirrorStatements.schemaVersion} WHERE NOT EXISTS (SELECT 1 FROM ${schema}.mirror_schema)`,
+			// Version 1's tables; `changesCreation` brings them to the current version.
+			`INSERT INTO ${schema}.mirror_schema (version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM ${schema}.mirror_schema)`,
 		];
 	}
 
@@ -94,6 +99,154 @@ export class MirrorStatements {
     ELSE ${postGIS}.st_setsrid(${postGIS}.st_makepoint(longitude, latitude), 4326) END) STORED`,
 			`CREATE INDEX IF NOT EXISTS notes_geometry ON ${this.schema}.notes USING gist (geometry)`,
 		];
+	}
+
+	get schemaVersionSelection(): string {
+		return `SELECT coalesce(max(version), 0) AS version FROM ${this.schema}.mirror_schema`;
+	}
+
+	schemaVersionUpdate(version: number): string {
+		return `UPDATE ${this.schema}.mirror_schema SET version = ${Math.trunc(version)}`;
+	}
+
+	/**
+	 * Version 2: every edit made in the database (by SQL, QGIS or any other client) is kept in
+	 * `changes` until the vault takes it. The plugin's own writes carry `vaultWriterMark` and
+	 * are not kept. An edited row is marked so the next copy writes it again from the vault,
+	 * whether or not the vault took the edit, and the vault's copy number moves so the plugin
+	 * reads the database again.
+	 */
+	get changesCreation(): string[] {
+		const schema = this.schema;
+		const edited = quotedLiteral("edited in the database");
+		return [
+			`CREATE TABLE IF NOT EXISTS ${schema}.changes (
+  change_id bigserial PRIMARY KEY,
+  vault text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('create', 'update', 'delete')),
+  path text NOT NULL,
+  new_path text,
+  set_properties jsonb NOT NULL DEFAULT '{}',
+  removed_properties text[] NOT NULL DEFAULT '{}',
+  place_changed boolean NOT NULL DEFAULT false,
+  latitude double precision,
+  longitude double precision,
+  made_at timestamptz NOT NULL DEFAULT now(),
+  made_by text NOT NULL DEFAULT current_user,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'failed', 'discarded')),
+  settled_at timestamptz,
+  message text
+)`,
+			`CREATE INDEX IF NOT EXISTS changes_pending ON ${schema}.changes (vault, change_id) WHERE status = 'pending'`,
+			// A note moved in the database takes its links along.
+			`ALTER TABLE ${schema}.links DROP CONSTRAINT IF EXISTS links_vault_source_path_fkey`,
+			`ALTER TABLE ${schema}.links ADD CONSTRAINT links_vault_source_path_fkey FOREIGN KEY (vault, source_path)
+  REFERENCES ${schema}.notes (vault, path) ON DELETE CASCADE ON UPDATE CASCADE`,
+			`CREATE OR REPLACE FUNCTION ${schema}.record_change() RETURNS trigger LANGUAGE plpgsql AS $record_change$
+DECLARE
+  edited_vault text;
+  set_properties jsonb := '{}';
+  removed_properties text[] := '{}';
+  property text;
+  moves boolean;
+  places boolean;
+BEGIN
+  -- The plugin's own writes are the vault's: there is nothing to bring back.
+  IF current_setting('obsidian.writer', true) = 'vault' THEN
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    -- Rows deleted with their vault's row are not notes to delete.
+    IF NOT EXISTS (SELECT 1 FROM ${schema}.vaults WHERE vault = OLD.vault) THEN RETURN OLD; END IF;
+    INSERT INTO ${schema}.changes (vault, kind, path) VALUES (OLD.vault, 'delete', OLD.path);
+    edited_vault := OLD.vault;
+  ELSE
+    -- The path is where the note is; name and folder follow it, or move the note when edited alone.
+    IF NEW.path IS NULL OR (TG_OP = 'UPDATE' AND NEW.path = OLD.path
+        AND (NEW.name IS DISTINCT FROM OLD.name OR NEW.folder IS DISTINCT FROM OLD.folder)) THEN
+      NEW.path := CASE WHEN coalesce(NEW.folder, '') = '' THEN '' ELSE NEW.folder || '/' END || NEW.name;
+    END IF;
+    NEW.path := ltrim(NEW.path, '/');
+    IF NEW.path !~* '\\.md$' THEN NEW.path := NEW.path || '.md'; END IF;
+    NEW.name := regexp_replace(regexp_replace(NEW.path, '^.*/', ''), '\\.md$', '', 'i');
+    NEW.folder := coalesce(substring(NEW.path FROM '^(.*)/[^/]*$'), '');
+    NEW.properties := coalesce(NEW.properties, '{}');
+    NEW.aliases := coalesce(NEW.aliases, '{}');
+    NEW.tags := coalesce(NEW.tags, '{}');
+    NEW.modified := coalesce(NEW.modified, now());
+    NEW.size_bytes := coalesce(NEW.size_bytes, 0);
+    NEW.content_digest := ${edited};
+    NEW.links_digest := coalesce(NEW.links_digest, ${edited});
+    IF TG_OP = 'INSERT' THEN
+      set_properties := NEW.properties;
+      IF cardinality(NEW.aliases) > 0 AND NOT set_properties ? 'aliases' THEN
+        set_properties := set_properties || jsonb_build_object('aliases', to_jsonb(NEW.aliases));
+      END IF;
+      INSERT INTO ${schema}.changes (vault, kind, path, set_properties, place_changed, latitude, longitude)
+      VALUES (NEW.vault, 'create', NEW.path, set_properties, NEW.latitude IS NOT NULL AND NEW.longitude IS NOT NULL,
+              NEW.latitude, NEW.longitude);
+      edited_vault := NEW.vault;
+    ELSE
+      FOR property IN SELECT jsonb_object_keys(NEW.properties) LOOP
+        IF NEW.properties -> property IS DISTINCT FROM OLD.properties -> property THEN
+          set_properties := set_properties || jsonb_build_object(property, NEW.properties -> property);
+        END IF;
+      END LOOP;
+      SELECT coalesce(array_agg(key), '{}') INTO removed_properties
+      FROM jsonb_object_keys(OLD.properties) AS key WHERE NOT NEW.properties ? key;
+      -- Aliases are a property of the note: an edit to the column is one to the property.
+      IF NEW.aliases IS DISTINCT FROM OLD.aliases AND NOT set_properties ? 'aliases' THEN
+        set_properties := set_properties || jsonb_build_object('aliases', to_jsonb(NEW.aliases));
+      END IF;
+      moves := NEW.path <> OLD.path;
+      places := NEW.latitude IS DISTINCT FROM OLD.latitude OR NEW.longitude IS DISTINCT FROM OLD.longitude;
+      -- Other columns (tags written in the text, sizes, dates) are the vault's: the next copy writes them again.
+      IF moves OR places OR set_properties <> '{}' OR cardinality(removed_properties) > 0 THEN
+        INSERT INTO ${schema}.changes (vault, kind, path, new_path, set_properties, removed_properties, place_changed, latitude, longitude)
+        VALUES (OLD.vault, 'update', OLD.path, CASE WHEN moves THEN NEW.path END, set_properties, removed_properties, places,
+                NEW.latitude, NEW.longitude);
+      END IF;
+      edited_vault := OLD.vault;
+    END IF;
+  END IF;
+  UPDATE ${schema}.vaults SET copy_number = copy_number + 1 WHERE vault = edited_vault;
+  PERFORM pg_notify(${quotedLiteral(MirrorStatements.changeChannel)}, json_build_object('schema', TG_TABLE_SCHEMA, 'vault', edited_vault)::text);
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END
+$record_change$`,
+			`DROP TRIGGER IF EXISTS record_change ON ${schema}.notes`,
+			`CREATE TRIGGER record_change BEFORE INSERT OR UPDATE OR DELETE ON ${schema}.notes
+  FOR EACH ROW EXECUTE FUNCTION ${schema}.record_change()`,
+		];
+	}
+
+	get changesExistence(): string {
+		return `SELECT to_regclass(${quotedLiteral(this.schema + ".changes")}) IS NOT NULL AS answer`;
+	}
+
+	get pendingChangeCount(): string {
+		return `SELECT count(*)::integer AS count FROM ${this.schema}.changes WHERE vault = $1 AND status = 'pending'`;
+	}
+
+	/** The oldest pending edits, locked so that another computer syncing the same vault skips them. */
+	get pendingChangeSelection(): string {
+		return `SELECT change_id, kind, path, new_path, set_properties, removed_properties, place_changed, latitude, longitude
+FROM ${this.schema}.changes WHERE vault = $1 AND status = 'pending'
+ORDER BY change_id LIMIT $2 FOR UPDATE SKIP LOCKED`;
+	}
+
+	/** Records how each edit in `$1`, a JSON array of `{change_id, status, message}`, went. */
+	get changeSettlement(): string {
+		return `UPDATE ${this.schema}.changes AS change SET status = settled.status, message = settled.message, settled_at = now()
+FROM jsonb_to_recordset($1::jsonb) AS settled(change_id bigint, status text, message text)
+WHERE change.change_id = settled.change_id`;
+	}
+
+	get pendingChangeDiscarding(): string {
+		return `UPDATE ${this.schema}.changes SET status = 'discarded', message = $2, settled_at = now()
+WHERE vault = $1 AND status = 'pending'`;
 	}
 
 	get tablesExistence(): string {
@@ -215,6 +368,63 @@ WHERE source.geometry IS NOT NULL AND destination.geometry IS NOT NULL AND sourc
 		}
 		return `CREATE VIEW ${this.schema}.notes_with_properties AS SELECT ${selections.join(",\n  ")}
 FROM ${this.schema}.notes note JOIN ${this.schema}.vaults vault ON vault.vault = note.vault`;
+	}
+
+	/**
+	 * Lets `notes_with_properties` be edited like a table: a typed column written is its property
+	 * written, under the spelling the note already uses; a point moved in QGIS is the note's new
+	 * place. The edits go to `notes`, whose trigger keeps them for the vault.
+	 */
+	notesWithPropertiesEditing(columns: PropertyColumn[], postGISSchema: string | null): string[] {
+		const schema = this.schema;
+		const updates: string[] = [];
+		const insertions: string[] = [];
+		for (const column of viewColumns(columns)) {
+			// A name holding the function's quote would end its body early.
+			if ([column.columnName, ...column.spellings].some((name) => name.includes("$edit_note$"))) continue;
+			const name = quotedIdentifier(column.columnName);
+			const spellings = column.spellings.map(quotedLiteral);
+			const mostUsed = spellings[0] ?? "''";
+			const spelling = spellings.length === 1
+				? mostUsed
+				: `CASE ${spellings.map((each) => `WHEN OLD.properties ? ${each} THEN ${each}`).join(" ")} ELSE ${mostUsed} END`;
+			updates.push(`  IF NEW.${name} IS DISTINCT FROM OLD.${name} THEN
+    edited := (edited - ARRAY[${spellings.join(", ")}]::text[]) || jsonb_build_object(${spelling}, to_jsonb(NEW.${name}));
+  END IF;`);
+			insertions.push(`    IF NEW.${name} IS NOT NULL THEN edited := edited || jsonb_build_object(${mostUsed}, to_jsonb(NEW.${name})); END IF;`);
+		}
+		const postGIS = postGISSchema === null ? null : quotedIdentifier(postGISSchema);
+		const placing = postGIS === null ? "" : `  IF NEW.geometry IS NOT NULL AND (TG_OP = 'INSERT' OR NEW.geometry IS DISTINCT FROM OLD.geometry) THEN
+    NEW.latitude := ${postGIS}.st_y(NEW.geometry);
+    NEW.longitude := ${postGIS}.st_x(NEW.geometry);
+  END IF;
+`;
+		return [
+			`CREATE OR REPLACE FUNCTION ${schema}.edit_note() RETURNS trigger LANGUAGE plpgsql AS $edit_note$
+DECLARE
+  edited jsonb;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    DELETE FROM ${schema}.notes WHERE vault = OLD.vault AND path = OLD.path;
+    RETURN OLD;
+  END IF;
+${placing}  edited := coalesce(NEW.properties, '{}');
+  IF TG_OP = 'INSERT' THEN
+${insertions.join("\n")}
+    INSERT INTO ${schema}.notes (vault, path, name, folder, properties, aliases, latitude, longitude)
+    VALUES (NEW.vault, NEW.path, NEW.name, NEW.folder, edited, NEW.aliases, NEW.latitude, NEW.longitude);
+    RETURN NEW;
+  END IF;
+${updates.join("\n")}
+  UPDATE ${schema}.notes SET path = NEW.path, name = NEW.name, folder = NEW.folder, properties = edited, aliases = NEW.aliases,
+    latitude = NEW.latitude, longitude = NEW.longitude
+  WHERE vault = OLD.vault AND path = OLD.path;
+  RETURN NEW;
+END
+$edit_note$`,
+			`CREATE TRIGGER edit_note INSTEAD OF INSERT OR UPDATE OR DELETE ON ${schema}.notes_with_properties
+  FOR EACH ROW EXECUTE FUNCTION ${schema}.edit_note()`,
+		];
 	}
 }
 

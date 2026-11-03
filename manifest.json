@@ -1,9 +1,9 @@
 {
-	"id": "vault-to-postgresql",
-	"name": "Vault to PostgreSQL",
+	"id": "postgresql-sync",
+	"name": "PostgreSQL Sync",
 	"version": "0.1.0",
 	"minAppVersion": "1.12.2",
-	"description": "Mirror your vault into PostgreSQL as tables you can query: notes, typed properties, tags, links and places, with PostGIS when the database has it.",
+	"description": "Sync your vault with PostgreSQL both ways: notes, typed properties, tags, links and places become tables you can query, and edits made in the database come back to your notes.",
 	"author": "felixchvl",
 	"authorUrl": "https://github.com/felixchvl",
 	"isDesktopOnly": true

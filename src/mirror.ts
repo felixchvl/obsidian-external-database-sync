@@ -1,5 +1,7 @@
 import pg from "pg";
 import type { ClientConfig, QueryResultRow } from "pg";
+import type { ChangeOutcome, DatabaseChange } from "./changes.ts";
+import { databaseChange } from "./changes.ts";
 import type { PropertyColumn, PropertyType } from "./properties.ts";
 import type { LinkRow, NoteDigests, NoteRow } from "./rows.ts";
 import { chunks, mirrorPlan } from "./rows.ts";
@@ -65,6 +67,16 @@ export interface VaultState {
 	rows(paths: string[]): { note: NoteRow; links: LinkRow[] }[];
 }
 
+/** What bringing the database's edits into the vault did. */
+export interface BringBackReport {
+	appliedCount: number;
+	failedCount: number;
+	/** Edits waiting for you to apply or discard them: more than a sync applies on its own. */
+	heldCount: number;
+	/** The first failures, in words. */
+	failures: string[];
+}
+
 export class MirrorError extends Error {}
 
 interface ServerState extends ServerDescription {
@@ -79,14 +91,16 @@ interface CopiedVaultState {
 }
 
 /**
- * Copies a vault's notes into PostgreSQL, one way: notes, typed properties, tags, aliases,
- * links resolved to files, and places, in a schema of tables and views other apps read (QGIS
- * among them). The vault is never written; the database can be emptied and copied again.
+ * Keeps a vault and a PostgreSQL schema in step. Copies the vault's notes into the database:
+ * notes, typed properties, tags, aliases, links resolved to files, and places, in tables and
+ * views other apps read (QGIS among them). Edits made in the database wait in `changes`, where
+ * `bringBack` hands them to the vault; the vault stays the reference, and the next copy writes
+ * every edited row again from it.
  *
  * Each copy writes only what changed, in one transaction, under a lock per vault, so a copy
  * from another device waits rather than interleaving. Between copies the mirror remembers
  * what the database holds, and does not read it again while its copy number is the one this
- * mirror set.
+ * mirror set; an edit made in the database moves that number.
  */
 export class PostgreSQLMirror {
 	/** Notes written per statement. */
@@ -135,16 +149,88 @@ export class PostgreSQLMirror {
 		}
 	}
 
-	/** Deletes the vault's rows, so the next copy writes every note again. */
+	/** Deletes the vault's rows, so the next copy writes every note again; the vault keeps its notes. */
 	async forget(vault: string): Promise<void> {
 		this.copiedStates.delete(vault);
 		await this.withConnection(async (client) => {
-			if (await exists(client, this.statements.tablesExistence)) await client.query(this.statements.vaultDeletion, [vault]);
+			if (!(await exists(client, this.statements.tablesExistence))) return;
+			await client.query("BEGIN");
+			await client.query(MirrorStatements.vaultWriterMark);
+			await client.query(this.statements.vaultDeletion, [vault]);
+			await client.query("COMMIT");
+		});
+	}
+
+	/** How many edits made in the database wait for the vault. */
+	async pendingChangeCount(vault: string): Promise<number> {
+		return this.withConnection(async (client) => {
+			if (!(await exists(client, this.statements.changesExistence))) return 0;
+			const counted = await client.query<{ count: number }>(this.statements.pendingChangeCount, [vault]);
+			return counted.rows[0]?.count ?? 0;
+		});
+	}
+
+	/**
+	 * Hands the edits made in the database to `apply`, oldest first, and records how each went.
+	 * More than `largestBatch` edits wait for `confirmed`, so that a mistaken `UPDATE` or
+	 * `DELETE` over the whole table does not reach every note.
+	 */
+	async bringBack(
+		vault: string,
+		apply: (change: DatabaseChange) => Promise<string | undefined | void>,
+		options: { largestBatch: number; confirmed: boolean },
+	): Promise<BringBackReport> {
+		const report: BringBackReport = { appliedCount: 0, failedCount: 0, heldCount: 0, failures: [] };
+		return this.withConnection(async (client) => {
+			if (!(await exists(client, this.statements.changesExistence))) return report;
+			const counted = await client.query<{ count: number }>(this.statements.pendingChangeCount, [vault]);
+			const pending = counted.rows[0]?.count ?? 0;
+			if (pending === 0) return report;
+			if (pending > options.largestBatch && !options.confirmed) return { ...report, heldCount: pending };
+			await client.query("BEGIN");
+			try {
+				const selected = await client.query<Parameters<typeof databaseChange>[0]>(
+					this.statements.pendingChangeSelection,
+					[vault, options.confirmed ? pending : options.largestBatch],
+				);
+				const outcomes: ChangeOutcome[] = [];
+				for (const row of selected.rows) {
+					const change = databaseChange(row);
+					try {
+						const remark = await apply(change);
+						outcomes.push({ changeId: change.changeId, status: "applied", message: remark || null });
+						report.appliedCount += 1;
+					} catch (error) {
+						const message = messageOf(error);
+						outcomes.push({ changeId: change.changeId, status: "failed", message });
+						report.failedCount += 1;
+						if (report.failures.length < 5) report.failures.push(message);
+					}
+				}
+				if (outcomes.length > 0) {
+					const settled = outcomes.map((outcome) => ({ change_id: outcome.changeId, status: outcome.status, message: outcome.message }));
+					await client.query(this.statements.changeSettlement, [JSON.stringify(settled)]);
+				}
+				await client.query("COMMIT");
+				return report;
+			} catch (error) {
+				await client.query("ROLLBACK").catch(() => undefined);
+				throw error;
+			}
+		});
+	}
+
+	/** Gives up the edits waiting for the vault; the next copy writes their rows again from the vault. */
+	async discardChanges(vault: string, reason: string): Promise<number> {
+		return this.withConnection(async (client) => {
+			if (!(await exists(client, this.statements.changesExistence))) return 0;
+			const discarded = await client.query(this.statements.pendingChangeDiscarding, [vault, reason]);
+			return discarded.rowCount ?? 0;
 		});
 	}
 
 	private async withConnection<Answer>(work: (client: pg.Client) => Promise<Answer>): Promise<Answer> {
-		const client = await this.connect();
+		const client = await openClient(this.settings);
 		try {
 			return await work(client);
 		} catch (error) {
@@ -156,46 +242,14 @@ export class PostgreSQLMirror {
 		}
 	}
 
-	private async connect(): Promise<pg.Client> {
-		const { host, port, database, user, password, security } = this.settings;
-		const base: ClientConfig = {
-			host, port, database, user, password,
-			connectionTimeoutMillis: 10_000,
-			application_name: "Obsidian Vault to PostgreSQL",
-		};
-		const open = async (ssl: ClientConfig["ssl"]) => {
-			const client = new pg.Client({ ...base, ssl });
-			// A connection that drops between queries reports here; the query in flight fails on its own.
-			client.on("error", () => undefined);
-			await client.connect();
-			return client;
-		};
-		try {
-			switch (security) {
-				case "off":
-					return await open(false);
-				case "verified":
-					return await open({ rejectUnauthorized: true });
-				case "preferred":
-					try {
-						return await open({ rejectUnauthorized: false });
-					} catch (error) {
-						if (!/does not support SSL/i.test(messageOf(error))) throw error;
-						return await open(false);
-					}
-			}
-		} catch (error) {
-			throw new MirrorError(`Could not connect to PostgreSQL at ${host}:${port}: ${messageOf(error)}`, { cause: error });
-		}
-	}
-
 	private async write(state: VaultState, client: pg.Client, start: number, rechecksDatabase: boolean): Promise<CopyReport> {
 		const statements = this.statements;
 		const server = await serverState(client);
-		const addsGeometry = await this.prepareSchema(client, server.postGISSchema);
+		const changesViews = await this.prepareSchema(client, server.postGISSchema);
 		const vault = state.vault;
 		await client.query("BEGIN");
 		try {
+			await client.query(MirrorStatements.vaultWriterMark);
 			await client.query(statements.vaultRegistration, [vault]);
 			await client.query(statements.vaultLock, [vault]);
 			const copyNumberRows = await client.query<{ copy_number: string }>(statements.copyNumberSelection, [vault]);
@@ -242,9 +296,9 @@ export class PostgreSQLMirror {
 
 			const changesColumns = await this.replacePropertyColumns(client, vault, state.columns);
 			const viewExists = await exists(client, statements.notesWithPropertiesExistence);
-			if (changesColumns || addsGeometry || !viewExists) await this.replaceViews(client, server);
+			if (changesColumns || changesViews || !viewExists) await this.replaceViews(client, server);
 			const changedSomething = plan.notePathsToWrite.length > 0 || plan.notePathsToDelete.length > 0;
-			if (changedSomething || changesColumns || addsGeometry || !viewExists) {
+			if (changedSomething || changesColumns || changesViews || !viewExists) {
 				const incremented = await client.query<{ copy_number: string }>(statements.copyNumberIncrement, [vault]);
 				copyNumber = incremented.rows[0]?.copy_number ?? copyNumber;
 				await client.query(MirrorStatements.notification);
@@ -267,10 +321,12 @@ export class PostgreSQLMirror {
 	}
 
 	/**
-	 * Creates the schema the first time, and the geometry column once PostGIS is installed.
-	 * Returns whether the geometry column was added now, which the views must then show.
+	 * Creates the schema the first time, brings an older one to the current version, and adds
+	 * the geometry column once PostGIS is installed. Returns whether the views must be defined
+	 * again: they show the geometry, and version 2 makes them editable.
 	 */
 	private async prepareSchema(client: pg.Client, postGISSchema: string | null): Promise<boolean> {
+		let migrated = false;
 		if (!this.hasPreparedSchema) {
 			if (!(await exists(client, this.statements.tablesExistence))) {
 				// Creating a schema needs a right on the database that using an existing one does not.
@@ -280,16 +336,29 @@ export class PostgreSQLMirror {
 				}
 				for (const statement of statementsToRun) await client.query(statement);
 			}
+			const versions = await client.query<{ version: number }>(this.statements.schemaVersionSelection);
+			if ((versions.rows[0]?.version ?? 0) < MirrorStatements.schemaVersion) {
+				await client.query("BEGIN");
+				try {
+					for (const statement of this.statements.changesCreation) await client.query(statement);
+					await client.query(this.statements.schemaVersionUpdate(MirrorStatements.schemaVersion));
+					await client.query("COMMIT");
+				} catch (error) {
+					await client.query("ROLLBACK").catch(() => undefined);
+					throw error;
+				}
+				migrated = true;
+			}
 			this.hasPreparedSchema = true;
 		}
-		if (postGISSchema === null) return false;
+		if (postGISSchema === null) return migrated;
 		const hasGeometry = await exists(
 			client,
 			`SELECT EXISTS (SELECT 1 FROM information_schema.columns
   WHERE table_schema = $1 AND table_name = 'notes' AND column_name = 'geometry') AS answer`,
 			[this.settings.schema],
 		);
-		if (hasGeometry) return false;
+		if (hasGeometry) return migrated;
 		for (const statement of this.statements.geometryColumnCreation(postGISSchema)) await client.query(statement);
 		return true;
 	}
@@ -328,7 +397,45 @@ export class PostgreSQLMirror {
 		// A view of your own that reads this one makes the drop fail, and the copy says so.
 		await client.query(this.statements.notesWithPropertiesDeletion);
 		await client.query(this.statements.notesWithPropertiesView(columns, server.postGISSchema !== null, server.validatesInput));
+		for (const statement of this.statements.notesWithPropertiesEditing(columns, server.postGISSchema)) await client.query(statement);
 		if (server.postGISSchema !== null) await client.query(this.statements.linksOnMapView(server.postGISSchema));
+	}
+}
+
+/** A connection to the server, encrypted as `settings.security` asks. */
+export async function openClient(settings: ConnectionSettings, options: { keepAlive?: boolean } = {}): Promise<pg.Client> {
+	const { port, password, security } = settings;
+	// Pasted values often carry spaces.
+	const [host, database, user] = [settings.host.trim(), settings.database.trim(), settings.user.trim()];
+	const base: ClientConfig = {
+		host, port, database, user, password,
+		connectionTimeoutMillis: 10_000,
+		application_name: "Obsidian PostgreSQL Sync",
+		keepAlive: options.keepAlive ?? false,
+	};
+	const open = async (ssl: ClientConfig["ssl"]) => {
+		const client = new pg.Client({ ...base, ssl });
+		// A connection that drops between queries reports here; the query in flight fails on its own.
+		client.on("error", () => undefined);
+		await client.connect();
+		return client;
+	};
+	try {
+		switch (security) {
+			case "off":
+				return await open(false);
+			case "verified":
+				return await open({ rejectUnauthorized: true });
+			case "preferred":
+				try {
+					return await open({ rejectUnauthorized: false });
+				} catch (error) {
+					if (!/does not support SSL/i.test(messageOf(error))) throw error;
+					return await open(false);
+				}
+		}
+	} catch (error) {
+		throw new MirrorError(`Could not connect to PostgreSQL at ${host}:${port}: ${messageOf(error)}`, { cause: error });
 	}
 }
 

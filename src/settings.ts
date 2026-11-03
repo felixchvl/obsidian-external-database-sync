@@ -1,10 +1,10 @@
 import type { App } from "obsidian";
 import { Notice, PluginSettingTab, SecretComponent, Setting } from "obsidian";
-import type VaultToPostgreSQLPlugin from "./main.ts";
+import type PostgreSQLSyncPlugin from "./main.ts";
 import type { TransportSecurity } from "./mirror.ts";
 import { messageOf } from "./mirror.ts";
 
-export interface MirrorSettings {
+export interface SyncSettings {
 	host: string;
 	port: number;
 	database: string;
@@ -13,8 +13,10 @@ export interface MirrorSettings {
 	passwordSecret: string;
 	security: TransportSecurity;
 	schema: string;
-	/** Copies changes as they happen; off until the server is set. */
+	/** Syncs changes as they happen; off until the server is set. */
 	copiesAutomatically: boolean;
+	/** Brings the edits made in the database into the vault; off, the vault overwrites them. */
+	bringsBackEdits: boolean;
 	/** The name that keys the vault's rows; empty for the vault's folder name. */
 	vaultName: string;
 	/** Properties that place a note, comma separated; empty to read them from the map plugins. */
@@ -23,7 +25,7 @@ export interface MirrorSettings {
 	excludedFolders: string;
 }
 
-export const defaultSettings: MirrorSettings = {
+export const defaultSettings: SyncSettings = {
 	host: "localhost",
 	port: 5432,
 	database: "",
@@ -32,15 +34,16 @@ export const defaultSettings: MirrorSettings = {
 	security: "preferred",
 	schema: "obsidian",
 	copiesAutomatically: false,
+	bringsBackEdits: true,
 	vaultName: "",
 	placeProperties: "",
 	excludedFolders: "",
 };
 
-export class MirrorSettingTab extends PluginSettingTab {
-	private readonly plugin: VaultToPostgreSQLPlugin;
+export class SyncSettingTab extends PluginSettingTab {
+	private readonly plugin: PostgreSQLSyncPlugin;
 
-	constructor(app: App, plugin: VaultToPostgreSQLPlugin) {
+	constructor(app: App, plugin: PostgreSQLSyncPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -111,15 +114,25 @@ export class MirrorSettingTab extends PluginSettingTab {
 				}
 			}));
 
-		new Setting(containerEl).setName("Copy").setHeading();
+		new Setting(containerEl).setName("Sync").setHeading();
 		new Setting(containerEl)
-			.setName("Copy automatically")
-			.setDesc("Copy the vault now, then each change a few seconds after it is made.")
+			.setName("Sync automatically")
+			.setDesc("Sync now, then each change a few seconds after it is made, in the vault or in the database.")
 			.addToggle((toggle) =>
 				toggle.setValue(settings.copiesAutomatically).onChange(async (value) => {
 					settings.copiesAutomatically = value;
 					await save();
-					if (value) this.plugin.scheduleCopy(0);
+					if (value) this.plugin.scheduleSync(0);
+				}));
+		new Setting(containerEl)
+			.setName("Bring database edits into the vault")
+			.setDesc("Edits made in the database come into your notes: properties, moves and renames, new notes, deletions (to the trash). "
+				+ "The text of your notes never changes. More than 50 edits at once wait for you to apply them. "
+				+ "Turned off, the vault overwrites what the database changes.")
+			.addToggle((toggle) =>
+				toggle.setValue(settings.bringsBackEdits).onChange(async (value) => {
+					settings.bringsBackEdits = value;
+					await save();
 				}));
 		new Setting(containerEl)
 			.setName("Vault name")
@@ -141,29 +154,45 @@ export class MirrorSettingTab extends PluginSettingTab {
 			});
 		new Setting(containerEl)
 			.setName("Excluded folders")
-			.setDesc("Notes in these folders are not copied. One folder per line.")
+			.setDesc("Notes in these folders are not copied, and the database cannot write in them. One folder per line.")
 			.addTextArea((text) =>
 				text.setPlaceholder("Private").setValue(settings.excludedFolders).onChange(async (value) => {
 					settings.excludedFolders = value;
 					await save();
 				}));
 
-		const status = new Setting(containerEl).setName("Last copy").setDesc(this.plugin.statusText());
+		const status = new Setting(containerEl).setName("Last sync").setDesc(this.plugin.statusText());
 		status
 			.addButton((button) =>
-				button.setButtonText("Copy now").onClick(async () => {
-					await this.copy(status, false);
+				button.setButtonText("Sync now").onClick(async () => {
+					await this.run(status, () => this.plugin.syncNow());
 				}))
 			.addButton((button) =>
 				button.setButtonText("Copy every note again").onClick(async () => {
-					await this.copy(status, true);
+					await this.run(status, () => this.plugin.syncNow({ rebuilds: true }));
 				}));
+		if (this.plugin.heldEditCount > 0) {
+			const held = new Setting(containerEl)
+				.setName("Edits held in the database")
+				.setDesc(`The database holds ${this.plugin.heldEditCount} edits, more than a sync applies on its own.`);
+			held
+				.addButton((button) =>
+					button.setButtonText("Apply them").setCta().onClick(async () => {
+						await this.run(status, () => this.plugin.syncNow({ appliesHeldEdits: true }));
+						if (this.plugin.heldEditCount === 0) held.settingEl.remove();
+					}))
+				.addButton((button) =>
+					button.setButtonText("Discard them").onClick(async () => {
+						await this.run(status, () => this.plugin.discardHeldEdits());
+						if (this.plugin.heldEditCount === 0) held.settingEl.remove();
+					}));
+		}
 	}
 
-	private async copy(status: Setting, rebuilds: boolean): Promise<void> {
-		status.setDesc("Copying…");
+	private async run(status: Setting, work: () => Promise<unknown>): Promise<void> {
+		status.setDesc("Syncing…");
 		try {
-			await this.plugin.copyNow({ rebuilds });
+			await work();
 		} catch (error) {
 			new Notice(messageOf(error));
 		}
