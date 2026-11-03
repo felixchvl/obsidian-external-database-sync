@@ -1,0 +1,10 @@
+{
+	"id": "postgresql-mirror",
+	"name": "PostgreSQL Mirror",
+	"version": "0.1.0",
+	"minAppVersion": "1.12.2",
+	"description": "Mirror your vault into PostgreSQL as tables you can query: notes, typed properties, tags, links and places, with PostGIS when the database has it.",
+	"author": "felixchvl",
+	"authorUrl": "https://github.com/felixchvl",
+	"isDesktopOnly": true
+}

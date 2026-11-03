@@ -1,0 +1,12 @@
+# npm
+node_modules/
+
+# The bundled plugin and its settings: main.js is attached to each GitHub release instead
+main.js
+*.map
+data.json
+
+# Editors and macOS
+.idea/
+.vscode/
+.DS_Store
