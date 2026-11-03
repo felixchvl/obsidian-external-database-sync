@@ -1,6 +1,6 @@
 import type { App } from "obsidian";
 import { Notice, PluginSettingTab, SecretComponent, Setting } from "obsidian";
-import type PostgreSQLMirrorPlugin from "./main.ts";
+import type VaultToPostgreSQLPlugin from "./main.ts";
 import type { TransportSecurity } from "./mirror.ts";
 import { messageOf } from "./mirror.ts";
 
@@ -38,9 +38,9 @@ export const defaultSettings: MirrorSettings = {
 };
 
 export class MirrorSettingTab extends PluginSettingTab {
-	private readonly plugin: PostgreSQLMirrorPlugin;
+	private readonly plugin: VaultToPostgreSQLPlugin;
 
-	constructor(app: App, plugin: PostgreSQLMirrorPlugin) {
+	constructor(app: App, plugin: VaultToPostgreSQLPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}

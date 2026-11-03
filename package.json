@@ -1,16 +1,16 @@
 {
-	"name": "obsidian-postgresql-mirror",
+	"name": "obsidian-vault-to-postgresql",
 	"version": "0.1.0",
 	"description": "An Obsidian plugin that mirrors the vault into PostgreSQL as tables you can query.",
 	"main": "main.js",
 	"type": "module",
 	"private": true,
 	"scripts": {
-		"dev": "node esbuild.config.mjs",
-		"build": "tsc --noEmit && node esbuild.config.mjs production",
+		"dev": "node esbuild.config.ts",
+		"build": "tsc --noEmit && node esbuild.config.ts production",
 		"test": "node --test tests/*.test.ts",
 		"lint": "eslint .",
-		"version": "node version-bump.mjs && git add manifest.json versions.json"
+		"version": "node version-bump.ts && git add manifest.json versions.json"
 	},
 	"keywords": ["obsidian", "postgresql", "postgis"],
 	"license": "MIT",

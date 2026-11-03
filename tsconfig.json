@@ -19,5 +19,5 @@
 		"types": ["node"],
 		"lib": ["ES2022", "DOM"]
 	},
-	"include": ["src/**/*.ts", "tests/**/*.ts"]
+	"include": ["src/**/*.ts", "tests/**/*.ts", "esbuild.config.ts", "version-bump.ts"]
 }

@@ -20,7 +20,7 @@ type CopyStatus =
 	| { kind: "copied"; report: CopyReport; at: Date }
 	| { kind: "failed"; message: string; at: Date };
 
-export default class PostgreSQLMirrorPlugin extends Plugin {
+export default class VaultToPostgreSQLPlugin extends Plugin {
 	settings: MirrorSettings = { ...defaultSettings };
 	private reader!: VaultReader;
 	private mirror: PostgreSQLMirror | undefined;
@@ -115,7 +115,7 @@ export default class PostgreSQLMirrorPlugin extends Plugin {
 			// Obsidian is still reading the vault: the `resolved` event schedules the copy again.
 			if (error instanceof VaultNotReadError) return;
 			// Said once, not at every change while the server stays unreachable.
-			if (!wasFailing) new Notice(`PostgreSQL Mirror: ${messageOf(error)}`);
+			if (!wasFailing) new Notice(`Vault to PostgreSQL: ${messageOf(error)}`);
 		}
 	}
 
@@ -285,9 +285,9 @@ export default class PostgreSQLMirrorPlugin extends Plugin {
 		this.statusBar.setAttribute("aria-label", this.statusText());
 	}
 
-	/** `obsidian postgresql-mirror`, `…:copy` and `…:test`, for the terminal, scripts and agents. */
+	/** `obsidian vault-to-postgresql`, `…:copy` and `…:test`, for the terminal, scripts and agents. */
 	private registerCommandLine(): void {
-		this.registerCliHandler("postgresql-mirror", "Show where the vault is copied and how the last copy went", null, () => {
+		this.registerCliHandler("vault-to-postgresql", "Show where the vault is copied and how the last copy went", null, () => {
 			const settings = this.settings;
 			const lines = [
 				`Server: ${settings.user || "?"}@${settings.host}:${settings.port}/${settings.database || "?"}, schema ${settings.schema}`,
@@ -298,7 +298,7 @@ export default class PostgreSQLMirrorPlugin extends Plugin {
 			return lines.join("\n");
 		});
 		this.registerCliHandler(
-			"postgresql-mirror:copy",
+			"vault-to-postgresql:copy",
 			"Copy the vault into PostgreSQL now",
 			{ rebuild: { description: "Delete the vault's rows first, and copy every note again" } },
 			async (params) => {
@@ -310,7 +310,7 @@ export default class PostgreSQLMirrorPlugin extends Plugin {
 				}
 			},
 		);
-		this.registerCliHandler("postgresql-mirror:test", "Connect to PostgreSQL and show its version", null, async () => {
+		this.registerCliHandler("vault-to-postgresql:test", "Connect to PostgreSQL and show its version", null, async () => {
 			try {
 				return await this.describeServer();
 			} catch (error) {

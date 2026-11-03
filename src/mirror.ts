@@ -161,7 +161,7 @@ export class PostgreSQLMirror {
 		const base: ClientConfig = {
 			host, port, database, user, password,
 			connectionTimeoutMillis: 10_000,
-			application_name: "Obsidian PostgreSQL Mirror",
+			application_name: "Obsidian Vault to PostgreSQL",
 		};
 		const open = async (ssl: ClientConfig["ssl"]) => {
 			const client = new pg.Client({ ...base, ssl });
