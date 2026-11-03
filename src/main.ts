@@ -1,3 +1,4 @@
+import type { TAbstractFile } from "obsidian";
 import { Notice, Plugin, normalizePath } from "obsidian";
 import type { ConnectionSettings, CopyReport } from "./mirror.ts";
 import { MirrorError, PostgreSQLMirror, messageOf, missingSetting } from "./mirror.ts";
@@ -63,9 +64,9 @@ export default class PostgreSQLMirrorPlugin extends Plugin {
 		this.app.workspace.onLayoutReady(() => {
 			this.isLayoutReady = true;
 			// Registered once the vault is loaded: Obsidian reports every file as created while it loads.
-			this.registerEvent(this.app.vault.on("create", () => this.filesChanged()));
-			this.registerEvent(this.app.vault.on("delete", () => this.filesChanged()));
-			this.registerEvent(this.app.vault.on("rename", () => this.filesChanged()));
+			this.registerEvent(this.app.vault.on("create", (file) => this.fileChanged(file)));
+			this.registerEvent(this.app.vault.on("delete", (file) => this.fileChanged(file)));
+			this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.fileChanged(file, oldPath)));
 			this.registerEvent(this.app.metadataCache.on("changed", () => this.scheduleCopy()));
 			this.registerEvent(this.app.metadataCache.on("deleted", () => this.scheduleCopy()));
 			// Obsidian has read every note: the copy can no longer miss one.
@@ -88,8 +89,8 @@ export default class PostgreSQLMirrorPlugin extends Plugin {
 		this.showStatus();
 	}
 
-	private filesChanged(): void {
-		this.reader.filesChanged();
+	private fileChanged(file: TAbstractFile, oldPath?: string): void {
+		this.reader.fileChanged(file, oldPath);
 		this.scheduleCopy();
 	}
 

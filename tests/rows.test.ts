@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { columnsByKey } from "../src/properties.ts";
-import { contentDigest, linksDigest, mirrorPlan, noteContent, sortedJson } from "../src/rows.ts";
+import { contentDigest, linkName, linksDigest, mirrorPlan, noteContent, sortedJson } from "../src/rows.ts";
 
 const source = {
 	path: "Places/Louvre.md",
@@ -44,4 +44,10 @@ test("a copy writes new and changed notes and deletes those the vault no longer 
 		new Map([["kept.md", same], ["changed.md", { ...same, linksDigest: "c" }], ["gone.md", same]]),
 	);
 	assert.deepEqual(plan, { notePathsToWrite: ["changed.md", "new.md"], notePathsToDelete: ["gone.md"] });
+});
+
+test("links and files go by their last segment when Obsidian resolves links", () => {
+	assert.equal(linkName("Places/Louvre.md"), "louvre");
+	assert.equal(linkName("Louvre"), "louvre");
+	assert.equal(linkName("Images/Map.PNG"), "map.png");
 });

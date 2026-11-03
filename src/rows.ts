@@ -100,6 +100,11 @@ export function noteContent(source: NoteSource, columnsByKey: Map<string, Proper
 	};
 }
 
+/** The name a link or a file goes by when Obsidian resolves links: its last segment, lowercased, without `.md`. */
+export function linkName(path: string): string {
+	return (path.split("/").pop() ?? "").toLowerCase().replace(/\.md$/, "");
+}
+
 export function linkRows(links: NoteLink[], sourcePath: string): LinkRow[] {
 	return links.map((link, offset) => ({
 		source_path: sourcePath,

@@ -1,10 +1,10 @@
-import type { App, CachedMetadata, TFile } from "obsidian";
-import { getAllTags, getLinkpath, parseFrontMatterAliases } from "obsidian";
+import type { App, CachedMetadata, TAbstractFile, TFile } from "obsidian";
+import { TFolder, getAllTags, getLinkpath, parseFrontMatterAliases } from "obsidian";
 import type { VaultState } from "./mirror.ts";
 import type { PropertyColumn, PropertyType } from "./properties.ts";
 import { columnsByKey, compareText, distinctNames, propertyColumns } from "./properties.ts";
 import type { NoteDigests, NoteLink, NoteSource } from "./rows.ts";
-import { contentDigest, linkRows, linksDigest, noteContent, sortedJson } from "./rows.ts";
+import { contentDigest, linkName, linkRows, linksDigest, noteContent, sortedJson } from "./rows.ts";
 
 export interface ReadingOptions {
 	vault: string;
@@ -23,26 +23,37 @@ interface ComputedNote {
 	/** The `linksVersion` the links digest was computed at. */
 	linksVersion: number;
 	linksDigest: string;
+	/** The file names the note's links name (`linkName`): a file of that name coming or going may change where they lead. */
+	linkNames: string[];
 }
+
 
 /**
  * Reads the vault from Obsidian's metadata cache, as the mirror copies it. Between copies it
- * remembers each note's digests, computed again only when Obsidian read the note again; links
- * resolve again for every note only when a file came, went or was renamed.
+ * remembers each note's digests, computed again only when Obsidian read the note again; a
+ * note's links resolve again when a file of a name they use came, went or was renamed.
  */
 export class VaultReader {
 	private readonly app: App;
 	private readonly computed = new Map<string, ComputedNote>();
 	private linksVersion = 0;
+	/** Names of files that came, went or were renamed since the last copy. */
+	private readonly changedFileNames = new Set<string>();
 	private columnsSignature = "";
 
 	constructor(app: App) {
 		this.app = app;
 	}
 
-	/** A file came, went or was renamed: links may reach other files now. */
-	filesChanged(): void {
-		this.linksVersion += 1;
+	/** A file came, went or was renamed (from `oldPath`): links using its names may reach other files now. */
+	fileChanged(file: TAbstractFile, oldPath?: string): void {
+		// A folder moves every file in it, which links may name by path: every link resolves again.
+		if (file instanceof TFolder) {
+			this.linksVersion += 1;
+			return;
+		}
+		this.changedFileNames.add(linkName(file.path));
+		if (oldPath !== undefined) this.changedFileNames.add(linkName(oldPath));
 	}
 
 	/** The vault as one copy sees it; undefined while Obsidian has not read every note yet. */
@@ -84,16 +95,20 @@ export class VaultReader {
 					contentDigest: contentDigest(content),
 					linksVersion: -1,
 					linksDigest: "",
+					linkNames: [],
 				};
 				this.computed.set(file.path, known);
 			}
-			if (known.linksVersion !== this.linksVersion) {
-				known.linksDigest = linksDigest(this.links(file, cache));
+			if (known.linksVersion !== this.linksVersion || known.linkNames.some((name) => this.changedFileNames.has(name))) {
+				const links = this.links(file, cache);
+				known.linksDigest = linksDigest(links);
 				known.linksVersion = this.linksVersion;
+				known.linkNames = [...new Set(links.map((link) => linkName(getLinkpath(link.target))))];
 			}
 			digests.set(file.path, { contentDigest: known.contentDigest, linksDigest: known.linksDigest });
 		}
 		for (const path of [...this.computed.keys()]) if (!digests.has(path)) this.computed.delete(path);
+		this.changedFileNames.clear();
 
 		return {
 			vault: options.vault,
