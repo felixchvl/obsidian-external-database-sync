@@ -1,6 +1,6 @@
 {
-	"id": "postgresql-sync",
-	"name": "PostgreSQL Sync",
+	"id": "postgresql-bridge",
+	"name": "PostgreSQL Bridge",
 	"version": "0.1.0",
 	"minAppVersion": "1.12.2",
 	"description": "Sync your vault with PostgreSQL both ways: notes, typed properties, tags, links and places become tables you can query, and edits made in the database come back to your notes.",

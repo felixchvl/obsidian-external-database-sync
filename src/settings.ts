@@ -1,6 +1,6 @@
 import type { App } from "obsidian";
 import { Notice, PluginSettingTab, SecretComponent, Setting } from "obsidian";
-import type PostgreSQLSyncPlugin from "./main.ts";
+import type PostgreSQLBridgePlugin from "./main.ts";
 import type { TransportSecurity } from "./mirror.ts";
 import { messageOf } from "./mirror.ts";
 
@@ -41,9 +41,9 @@ export const defaultSettings: SyncSettings = {
 };
 
 export class SyncSettingTab extends PluginSettingTab {
-	private readonly plugin: PostgreSQLSyncPlugin;
+	private readonly plugin: PostgreSQLBridgePlugin;
 
-	constructor(app: App, plugin: PostgreSQLSyncPlugin) {
+	constructor(app: App, plugin: PostgreSQLBridgePlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}

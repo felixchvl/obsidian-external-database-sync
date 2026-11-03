@@ -1,5 +1,5 @@
 {
-	"name": "obsidian-postgresql-sync",
+	"name": "obsidian-postgresql-bridge",
 	"version": "0.1.0",
 	"description": "An Obsidian plugin that syncs the vault with PostgreSQL both ways.",
 	"main": "main.js",

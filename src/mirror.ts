@@ -410,7 +410,7 @@ export async function openClient(settings: ConnectionSettings, options: { keepAl
 	const base: ClientConfig = {
 		host, port, database, user, password,
 		connectionTimeoutMillis: 10_000,
-		application_name: "Obsidian PostgreSQL Sync",
+		application_name: "Obsidian PostgreSQL Bridge",
 		keepAlive: options.keepAlive ?? false,
 	};
 	const open = async (ssl: ClientConfig["ssl"]) => {

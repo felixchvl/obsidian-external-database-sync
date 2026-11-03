@@ -1,4 +1,4 @@
-# PostgreSQL Sync
+# PostgreSQL Bridge
 
 An Obsidian plugin that syncs your vault with PostgreSQL, both ways.
 
@@ -87,7 +87,7 @@ Safeguards:
 
 ## Setting it up
 
-1. Install the plugin, then open **Settings → PostgreSQL Sync**.
+1. Install the plugin, then open **Settings → PostgreSQL Bridge**.
 2. Fill in the server, database and user. The password goes in Obsidian's secret storage, never in the plugin's settings file.
 3. Select **Test** to check the connection.
 4. Turn on **Sync automatically**. The plugin syncs now, then each change a few seconds after you make it, in the vault or in the database.
@@ -101,12 +101,12 @@ The plugin runs on desktop only: it talks to PostgreSQL directly over the networ
 With the [Obsidian CLI](https://help.obsidian.md/cli) and Obsidian open:
 
 ```bash
-obsidian postgresql-sync                # where the vault syncs and how the last sync went
-obsidian postgresql-sync:test           # connect and show the server's version
-obsidian postgresql-sync:sync           # sync now
-obsidian postgresql-sync:sync apply     # sync, applying however many edits the database holds
-obsidian postgresql-sync:sync rebuild   # delete the vault's rows and copy every note again
-obsidian postgresql-sync:discard        # discard the edits the database holds, then sync
+obsidian postgresql-bridge                # where the vault syncs and how the last sync went
+obsidian postgresql-bridge:test           # connect and show the server's version
+obsidian postgresql-bridge:sync           # sync now
+obsidian postgresql-bridge:sync apply     # sync, applying however many edits the database holds
+obsidian postgresql-bridge:sync rebuild   # delete the vault's rows and copy every note again
+obsidian postgresql-bridge:discard        # discard the edits the database holds, then sync
 ```
 
 ## How it copies
@@ -135,7 +135,7 @@ The integration tests need a PostgreSQL server; they create schemas of their own
 MIRROR_TEST_DATABASE=postgres://user@localhost/database npm test
 ```
 
-To try the plugin, copy `main.js` and `manifest.json` into `<vault>/.obsidian/plugins/postgresql-sync/`, then enable it in **Settings → Community plugins**.
+To try the plugin, copy `main.js` and `manifest.json` into `<vault>/.obsidian/plugins/postgresql-bridge/`, then enable it in **Settings → Community plugins**.
 
 The tables are those of [Graphite](https://github.com/Graphite-Note/Graphite)'s PostgreSQL Mirror, with `changes` beside them. Give each its own schema: to this plugin, Graphite's copies would be edits made in the database.
 

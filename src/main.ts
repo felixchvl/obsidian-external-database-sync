@@ -41,7 +41,7 @@ interface SyncOptions {
 	appliesHeldEdits: boolean;
 }
 
-export default class PostgreSQLSyncPlugin extends Plugin {
+export default class PostgreSQLBridgePlugin extends Plugin {
 	settings: SyncSettings = { ...defaultSettings };
 	private reader!: VaultReader;
 	private writer!: VaultWriter;
@@ -162,17 +162,17 @@ export default class PostgreSQLSyncPlugin extends Plugin {
 			const report = await this.enqueueSync({ rebuilds: false, rechecksDatabase: false, appliesHeldEdits: false });
 			const brought = report.brought;
 			if (brought && brought.heldCount > 0 && brought.heldCount !== heldBefore) {
-				new Notice(`PostgreSQL Sync: the database holds ${brought.heldCount} edits, more than ${largestAutomaticBatch} at once. `
+				new Notice(`PostgreSQL Bridge: the database holds ${brought.heldCount} edits, more than ${largestAutomaticBatch} at once. `
 					+ "Run “Apply the edits held in the database” to bring them into your notes, or “Discard” them.", 15_000);
 			}
 			if (brought && brought.failedCount > 0) {
-				new Notice(`PostgreSQL Sync: ${brought.failedCount} edits from the database could not be applied: ${brought.failures.join("; ")}`, 15_000);
+				new Notice(`PostgreSQL Bridge: ${brought.failedCount} edits from the database could not be applied: ${brought.failures.join("; ")}`, 15_000);
 			}
 		} catch (error) {
 			// Obsidian is still reading the vault: the `resolved` event schedules the sync again.
 			if (error instanceof VaultNotReadError) return;
 			// Said once, not at every change while the server stays unreachable.
-			if (!wasFailing) new Notice(`PostgreSQL Sync: ${messageOf(error)}`);
+			if (!wasFailing) new Notice(`PostgreSQL Bridge: ${messageOf(error)}`);
 		}
 	}
 
@@ -395,7 +395,7 @@ export default class PostgreSQLSyncPlugin extends Plugin {
 		this.statusBar.setAttribute("aria-label", this.statusText());
 	}
 
-	/** `obsidian postgresql-sync`, `…:sync`, `…:discard` and `…:test`, for the terminal, scripts and agents. */
+	/** `obsidian postgresql-bridge`, `…:sync`, `…:discard` and `…:test`, for the terminal, scripts and agents. */
 	private registerCommandLine(): void {
 		const answer = async (work: () => Promise<string>) => {
 			try {
@@ -404,7 +404,7 @@ export default class PostgreSQLSyncPlugin extends Plugin {
 				return `Error: ${messageOf(error)}`;
 			}
 		};
-		this.registerCliHandler("postgresql-sync", "Show where the vault syncs and how the last sync went", null, () => {
+		this.registerCliHandler("postgresql-bridge", "Show where the vault syncs and how the last sync went", null, () => {
 			const settings = this.settings;
 			return [
 				`Server: ${settings.user || "?"}@${settings.host}:${settings.port}/${settings.database || "?"}, schema ${settings.schema}`,
@@ -415,7 +415,7 @@ export default class PostgreSQLSyncPlugin extends Plugin {
 			].join("\n");
 		});
 		this.registerCliHandler(
-			"postgresql-sync:sync",
+			"postgresql-bridge:sync",
 			"Sync now: bring the database's edits into the vault, then copy the vault into the database",
 			{
 				rebuild: { description: "Delete the vault's rows first, and copy every note again" },
@@ -426,9 +426,9 @@ export default class PostgreSQLSyncPlugin extends Plugin {
 				return this.statusText();
 			}),
 		);
-		this.registerCliHandler("postgresql-sync:discard", "Discard the edits held in the database, then sync", null, () =>
+		this.registerCliHandler("postgresql-bridge:discard", "Discard the edits held in the database, then sync", null, () =>
 			answer(async () => `${await this.discardHeldEdits()} edits discarded. ${this.statusText()}`));
-		this.registerCliHandler("postgresql-sync:test", "Connect to PostgreSQL and show its version", null, () =>
+		this.registerCliHandler("postgresql-bridge:test", "Connect to PostgreSQL and show its version", null, () =>
 			answer(() => this.describeServer()));
 	}
 }
